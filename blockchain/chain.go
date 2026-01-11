@@ -1,6 +1,8 @@
 package blockchain
 
 import (
+	"blockchain/wallet"
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"log"
@@ -9,9 +11,7 @@ import (
 	"github.com/boltdb/bolt"
 )
 
-const (
-	blocksBucket = "blocks"
-)
+const blocksBucket = "blocks"
 
 type BlockChain struct {
 	NewestHash string
@@ -30,7 +30,7 @@ func GetBlockchain(address string) *BlockChain {
 
 		var newestHash string
 		err = db.Update(func(tx *bolt.Tx) error {
-			bucket, _ := tx.CreateBucketIfNotExists([]byte("blocks"))
+			bucket, _ := tx.CreateBucketIfNotExists([]byte(blocksBucket))
 			lastHash := bucket.Get([]byte("l"))
 
 			if lastHash == nil {
@@ -51,16 +51,20 @@ func GetBlockchain(address string) *BlockChain {
 	return bInstance
 }
 
-// UTXO 검색 (내 주소로 된 안 쓴 돈 찾기)
 func (bc *BlockChain) FindUnspentTransactions(address string) []Transaction {
 	var unspentTXs []Transaction
 	spentTXs := make(map[string][]int)
 
 	currHash := bc.NewestHash
 	bc.DB.View(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket([]byte("blocks"))
+		bucket := tx.Bucket([]byte(blocksBucket))
 		for {
-			block := Deserialize(bucket.Get([]byte(currHash)))
+			blockBytes := bucket.Get([]byte(currHash))
+			if blockBytes == nil {
+				break
+			}
+			block := Deserialize(blockBytes)
+
 			for _, t := range block.Transactions {
 				txID := hex.EncodeToString(t.ID)
 			Outputs:
@@ -72,13 +76,15 @@ func (bc *BlockChain) FindUnspentTransactions(address string) []Transaction {
 							}
 						}
 					}
-					if out.PubKey == address {
+					// TxOutput의 PubKey와 현재 조회 주소 비교
+					if string(out.PubKey) == address {
 						unspentTXs = append(unspentTXs, *t)
 					}
 				}
 				if !t.IsCoinbase() {
 					for _, in := range t.Ins {
-						if in.FromAddr == address {
+						// TxInput의 PubKey를 주소로 간주하여 비교 (단순화 버전)
+						if string(in.PubKey) == address {
 							inTxID := hex.EncodeToString(in.TxID)
 							spentTXs[inTxID] = append(spentTXs[inTxID], in.OutIndex)
 						}
@@ -97,10 +103,9 @@ func (bc *BlockChain) FindUnspentTransactions(address string) []Transaction {
 
 func (bc *BlockChain) GetBalance(address string) int {
 	balance := 0
-	utxos := bc.FindUnspentTransactions(address)
-	for _, tx := range utxos {
+	for _, tx := range bc.FindUnspentTransactions(address) {
 		for _, out := range tx.Outs {
-			if out.PubKey == address {
+			if string(out.PubKey) == address {
 				balance += out.Value
 			}
 		}
@@ -109,25 +114,28 @@ func (bc *BlockChain) GetBalance(address string) int {
 }
 
 func (bc *BlockChain) AddBlock(txs []*Transaction, miner string) {
-	// 1. 이 블록을 위한 코인베이스 트랜잭션 생성 (채굴 보상 50)
-	cbTx := NewCoinbaseTX(miner, fmt.Sprintf("Reward for Block: %s", bc.NewestHash))
-
-	// 2. 코인베이스를 맨 앞에 두고, 일반 거래들을 뒤에 붙임
-	var blockTxs []*Transaction
-	blockTxs = append(blockTxs, cbTx)
-	blockTxs = append(blockTxs, txs...)
-
-	// 3. 이 트랜잭션 뭉치를 가지고 새로운 블록 객체 생성
-	newBlock := &Block{
-		Transactions: blockTxs,
-		PrevHash:     bc.NewestHash, // 이전 블록과 연결
-		Nonce:        0,
+	for _, tx := range txs {
+		if !tx.IsCoinbase() {
+			prevTXs := make(map[string]Transaction)
+			for _, vin := range tx.Ins {
+				prevTX, err := bc.FindTransaction(vin.TxID)
+				if err != nil {
+					log.Panic(err)
+				}
+				prevTXs[hex.EncodeToString(prevTX.ID)] = prevTX
+			}
+			if !tx.Verify(prevTXs) {
+				log.Panic("Verify Failed")
+			}
+		}
 	}
-
+	cbTx := NewCoinbaseTX(miner, fmt.Sprintf("Reward for Block: %x", bc.NewestHash))
+	blockTxs := append([]*Transaction{cbTx}, txs...)
+	newBlock := &Block{blockTxs, "", bc.NewestHash, 0}
 	newBlock.Mine()
 
 	bc.DB.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket([]byte("blocks"))
+		bucket := tx.Bucket([]byte(blocksBucket))
 		bucket.Put([]byte(newBlock.Hash), newBlock.Serialize())
 		bucket.Put([]byte("l"), []byte(newBlock.Hash))
 		bc.NewestHash = newBlock.Hash
@@ -135,20 +143,16 @@ func (bc *BlockChain) AddBlock(txs []*Transaction, miner string) {
 	})
 }
 
-// FindSpendableOutputs: 송금에 필요한 충분한 액수의 UTXO들을 찾아 반환
 func (bc *BlockChain) FindSpendableOutputs(address string, amount int) (int, map[string][]int) {
 	unspentOutputs := make(map[string][]int)
-	unspentTXs := bc.FindUnspentTransactions(address)
 	accumulated := 0
-
 Work:
-	for _, tx := range unspentTXs {
+	for _, tx := range bc.FindUnspentTransactions(address) {
 		txID := hex.EncodeToString(tx.ID)
 		for outIdx, out := range tx.Outs {
-			if out.PubKey == address && accumulated < amount {
+			if string(out.PubKey) == address && accumulated < amount {
 				accumulated += out.Value
 				unspentOutputs[txID] = append(unspentOutputs[txID], outIdx)
-
 				if accumulated >= amount {
 					break Work
 				}
@@ -158,53 +162,76 @@ Work:
 	return accumulated, unspentOutputs
 }
 
-// NewTransaction: 일반적인 송금 트랜잭션 생성
-func (bc *BlockChain) NewTransaction(from, to string, amount int) *Transaction {
-	var inputs []TxInput
-	var outputs []TxOutput
-
-	acc, validOutputs := bc.FindSpendableOutputs(from, amount)
-
+func (bc *BlockChain) NewTransaction(w *wallet.Wallet, to string, amount int) *Transaction {
+	acc, validOutputs := bc.FindSpendableOutputs(w.GetAddress(), amount)
 	if acc < amount {
-		log.Panic("에러: 잔액이 부족합니다")
+		log.Panic("Not enough funds")
 	}
 
-	// Input 생성 (찾은 UTXO들을 소모)
+	var inputs []TxInput
 	for txid, outs := range validOutputs {
 		txID, _ := hex.DecodeString(txid)
 		for _, out := range outs {
-			input := TxInput{txID, out, from}
-			inputs = append(inputs, input)
+			inputs = append(inputs, TxInput{txID, out, nil, w.PublicKey})
 		}
 	}
 
-	// Output 생성 (상대방에게 전송)
-	outputs = append(outputs, TxOutput{amount, to})
-
-	// 거스름돈 처리
+	outputs := []TxOutput{{amount, []byte(to)}}
 	if acc > amount {
-		outputs = append(outputs, TxOutput{acc - amount, from})
+		outputs = append(outputs, TxOutput{acc - amount, []byte(w.GetAddress())})
 	}
 
 	tx := Transaction{nil, inputs, outputs}
 	tx.SetID()
+
+	prevTXs := make(map[string]Transaction)
+	for _, vin := range tx.Ins {
+		prevTX, _ := bc.FindTransaction(vin.TxID)
+		prevTXs[hex.EncodeToString(prevTX.ID)] = prevTX
+	}
+	tx.Sign(w.PrivateKey, prevTXs)
 	return &tx
+}
+
+func (bc *BlockChain) FindTransaction(ID []byte) (Transaction, error) {
+	currHash := bc.NewestHash
+	var targetTx Transaction
+	err := bc.DB.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(blocksBucket))
+		for {
+			blockBytes := bucket.Get([]byte(currHash))
+			if blockBytes == nil {
+				break
+			}
+			block := Deserialize(blockBytes)
+			for _, t := range block.Transactions {
+				if bytes.Equal(t.ID, ID) {
+					targetTx = *t
+					return nil
+				}
+			}
+			if len(block.PrevHash) == 0 {
+				break
+			}
+			currHash = block.PrevHash
+		}
+		return fmt.Errorf("TX not found")
+	})
+	return targetTx, err
 }
 
 func (bc *BlockChain) AllBlocks() []*Block {
 	var blocks []*Block
 	currHash := bc.NewestHash
-
 	bc.DB.View(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket([]byte(blocksBucket))
-
-		// 1. 최신 해시부터 시작해서 PrevHash가 없을 때까지 루프
 		for {
 			blockBytes := bucket.Get([]byte(currHash))
+			if blockBytes == nil {
+				break
+			}
 			block := Deserialize(blockBytes)
 			blocks = append(blocks, block)
-
-			// 2. 제네시스 블록(이전 해시가 없음)에 도달하면 종료
 			if len(block.PrevHash) == 0 {
 				break
 			}
