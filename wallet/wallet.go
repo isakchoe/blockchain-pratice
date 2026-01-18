@@ -4,10 +4,13 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"fmt"
 	"log"
 	"math/big"
+
+	"github.com/mr-tron/base58"
 )
+
+const version = byte(0x00)
 
 type Wallet struct {
 	RawPrivateKey []byte
@@ -63,8 +66,11 @@ func padBytes(b []byte, length int) []byte {
 	return padded
 }
 
-// GetAddress: 현재는 간단하게 주소 반환 (나중에 Base58로 변경 예정)
 func (w Wallet) GetAddress() string {
-	// 임시 주소 로직 (기존과 동일하게 유지하거나 바이트를 문자열로)
-	return fmt.Sprintf("%x", w.PublicKey)
+	pubKeyHash := HashPubKey(w.PublicKey)
+	versionedPayload := append([]byte{version}, pubKeyHash...)
+	checksum := Checksum(versionedPayload)
+	fullPayload := append(versionedPayload, checksum...)
+	address := base58.Encode(fullPayload)
+	return address
 }

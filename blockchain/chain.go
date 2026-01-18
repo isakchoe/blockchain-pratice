@@ -193,6 +193,40 @@ func (bc *BlockChain) NewTransaction(w *wallet.Wallet, to string, amount int) *T
 	return &tx
 }
 
+// NewAttackTransaction: 해커의 지갑을 쓰지만, 인풋은 피해자의 UTXO를 강제로 가리킴
+func (bc *BlockChain) NewAttackTransaction(hackerWallet *wallet.Wallet, to string, amount int, victimTxIDStr string, victimIdx int) *Transaction {
+	var inputs []TxInput
+	var outputs []TxOutput
+
+	// 1. 피해자의 TxID를 해킹 타겟으로 설정
+	victimTxID, _ := hex.DecodeString(victimTxIDStr)
+
+	// 2. [핵심 조작]
+	// 인풋은 피해자의 것(victimTxID, victimIdx)을 가리키지만,
+	// 공개키(PubKey)는 해커의 것을 넣습니다. (나중에 해커 비밀키로 서명하기 위해)
+	input := TxInput{victimTxID, victimIdx, nil, hackerWallet.PublicKey}
+	inputs = append(inputs, input)
+
+	// 3. 아웃풋 설정 (보통 해커 본인 주소로 보냄)
+	outputs = append(outputs, TxOutput{amount, []byte(to)})
+
+	tx := &Transaction{nil, inputs, outputs}
+	tx.SetID()
+
+	// 4. 서명에 필요한 이전 트랜잭션 정보(피해자의 것)를 찾아옴
+	prevTXs := make(map[string]Transaction)
+	prevTX, err := bc.FindTransaction(victimTxID)
+	if err != nil {
+		log.Panic("Victim TX not found")
+	}
+	prevTXs[hex.EncodeToString(prevTX.ID)] = prevTX
+
+	// 5. 해커의 비밀키로 서명!
+	tx.Sign(hackerWallet.GetPrivateKey(), prevTXs)
+
+	return tx
+}
+
 func (bc *BlockChain) FindTransaction(ID []byte) (Transaction, error) {
 	currHash := bc.NewestHash
 	var targetTx Transaction

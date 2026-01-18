@@ -8,6 +8,8 @@ import (
 	"crypto/sha256"
 	"encoding/gob"
 	"encoding/hex"
+	"fmt"
+	"log"
 	"math/big"
 )
 
@@ -81,8 +83,18 @@ func (tx *Transaction) Verify(prevTXs map[string]Transaction) bool {
 	curve := elliptic.P256()
 
 	for inID, vin := range tx.Ins {
+
+		// ⭐️ 여기서 길이를 체크합니다.
+		// 만약 주소가 들어있다면 길이는 약 34일 것이고, 여기서 패닉이 터집니다.
+		fmt.Printf("DEBUG: Input ID %d, PubKey Length: %d\n", inID, len(vin.PubKey))
+
+		if len(vin.PubKey) != 64 {
+			log.Fatalf("🚨 ERROR: PubKey is NOT 64 bytes! Actual length: %d. Data: %s", len(vin.PubKey), string(vin.PubKey))
+		}
+
 		prevTx := prevTXs[hex.EncodeToString(vin.TxID)]
 		txCopy.Ins[inID].Signature = nil
+		//
 		txCopy.Ins[inID].PubKey = prevTx.Outs[vin.OutIndex].PubKey
 		txCopy.ID = txCopy.Hash()
 		txCopy.Ins[inID].PubKey = nil
