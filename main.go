@@ -11,15 +11,25 @@ import (
 )
 
 var bc *blockchain.BlockChain
-var wallets map[string]*wallet.Wallet // 테스트용 지갑 저장소
+var wallets *wallet.Wallets // 테스트용 지갑 저장소
 
 func main() {
-	wallets = make(map[string]*wallet.Wallet)
 
-	// 초기 채굴자 지갑 생성 및 제네시스 블록 생성
-	minerWallet := wallet.NewWallet()
-	minerAddr := minerWallet.GetAddress()
-	wallets[minerAddr] = minerWallet
+	// 1 저장된 지갑들 불러오기
+	var err error
+	wallets, err = wallet.NewWallets()
+	if err != nil {
+		fmt.Println("No wallets found, creating miner wallet")
+		wallets.CreateWallet()
+		wallets.SaveToFile()
+	}
+
+	// 2 채굴자 주소 가져오기
+	var minerAddr string
+	for addr := range wallets.Wallets {
+		minerAddr = addr
+		break
+	}
 
 	fmt.Printf("Miner Address: %s\n", minerAddr)
 	bc = blockchain.GetBlockchain(minerAddr)
@@ -36,10 +46,8 @@ func main() {
 
 // 1. 새로운 지갑 생성 API: /wallet
 func createWalletHandler(w http.ResponseWriter, r *http.Request) {
-	newWallet := wallet.NewWallet()
-	addr := newWallet.GetAddress()
-	wallets[addr] = newWallet // 메모리에 저장
-
+	addr := wallets.CreateWallet()
+	wallets.SaveToFile()
 	fmt.Fprintf(w, "New Wallet Created!\nAddress: %s\n", addr)
 }
 
@@ -57,7 +65,7 @@ func sendHandler(w http.ResponseWriter, r *http.Request) {
 	amount, _ := strconv.Atoi(r.URL.Query().Get("amount"))
 
 	// 1. 지갑 저장소에서 비공개키가 포함된 지갑 객체 찾기
-	fromWallet, ok := wallets[from]
+	fromWallet, ok := wallets.Wallets[from]
 	if !ok {
 		http.Error(w, "Sender wallet not found in server memory", 400)
 		return

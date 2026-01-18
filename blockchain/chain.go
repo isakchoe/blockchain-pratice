@@ -189,7 +189,7 @@ func (bc *BlockChain) NewTransaction(w *wallet.Wallet, to string, amount int) *T
 		prevTX, _ := bc.FindTransaction(vin.TxID)
 		prevTXs[hex.EncodeToString(prevTX.ID)] = prevTX
 	}
-	tx.Sign(w.PrivateKey, prevTXs)
+	tx.Sign(w.GetPrivateKey(), prevTXs)
 	return &tx
 }
 
