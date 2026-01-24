@@ -51,9 +51,13 @@ func GetBlockchain(address string) *BlockChain {
 	return bInstance
 }
 
+// FindUnspentTransactions: 사용되지 않은 트랜잭션 목록 반환
 func (bc *BlockChain) FindUnspentTransactions(address string) []Transaction {
 	var unspentTXs []Transaction
-	spentTXs := make(map[string][]int)
+	spentTXs := make(map[string][]int) // TxID -> []OutIndex (사용된 아웃풋 기록)
+
+	// 주소 문자열을 해시로 변환 (비교용)
+	targetPubKeyHash := wallet.Base58ToPubKeyHash(address)
 
 	currHash := bc.NewestHash
 	bc.DB.View(func(tx *bolt.Tx) error {
@@ -67,8 +71,10 @@ func (bc *BlockChain) FindUnspentTransactions(address string) []Transaction {
 
 			for _, t := range block.Transactions {
 				txID := hex.EncodeToString(t.ID)
+
 			Outputs:
 				for outIdx, out := range t.Outs {
+					// 1. 이미 사용된 기록이 있는지 확인
 					if spentTXs[txID] != nil {
 						for _, spentOut := range spentTXs[txID] {
 							if spentOut == outIdx {
@@ -76,18 +82,17 @@ func (bc *BlockChain) FindUnspentTransactions(address string) []Transaction {
 							}
 						}
 					}
-					// TxOutput의 PubKey와 현재 조회 주소 비교
-					if string(out.PubKey) == address {
+					// 2. ⭐️ 수정: 주소 문자열 비교가 아닌 PubKeyHash 비교
+					if bytes.Equal(out.PubKeyHash, targetPubKeyHash) {
 						unspentTXs = append(unspentTXs, *t)
 					}
 				}
+
+				// 3. ⭐️ 수정: 누가 썼는지 따지지 않고, 인풋이 가리키는 건 무조건 Spent 처리
 				if !t.IsCoinbase() {
 					for _, in := range t.Ins {
-						// TxInput의 PubKey를 주소로 간주하여 비교 (단순화 버전)
-						if string(in.PubKey) == address {
-							inTxID := hex.EncodeToString(in.TxID)
-							spentTXs[inTxID] = append(spentTXs[inTxID], in.OutIndex)
-						}
+						inTxID := hex.EncodeToString(in.TxID)
+						spentTXs[inTxID] = append(spentTXs[inTxID], in.OutIndex)
 					}
 				}
 			}
@@ -103,9 +108,13 @@ func (bc *BlockChain) FindUnspentTransactions(address string) []Transaction {
 
 func (bc *BlockChain) GetBalance(address string) int {
 	balance := 0
-	for _, tx := range bc.FindUnspentTransactions(address) {
+	pubKeyHash := wallet.Base58ToPubKeyHash(address)
+	unspentTXs := bc.FindUnspentTransactions(address)
+
+	for _, tx := range unspentTXs {
 		for _, out := range tx.Outs {
-			if string(out.PubKey) == address {
+			// 내 자물쇠(PubKeyHash)로 잠긴 금액만 합산
+			if bytes.Equal(out.PubKeyHash, pubKeyHash) {
 				balance += out.Value
 			}
 		}
@@ -124,8 +133,9 @@ func (bc *BlockChain) AddBlock(txs []*Transaction, miner string) {
 				}
 				prevTXs[hex.EncodeToString(prevTX.ID)] = prevTX
 			}
+			// ⭐️ 여기서 Verify가 실행되며 "주인 확인"과 "서명 확인"을 동시에 함
 			if !tx.Verify(prevTXs) {
-				log.Panic("Verify Failed")
+				log.Panic("Verify Failed: Invalid transaction owner or signature")
 			}
 		}
 	}
@@ -146,11 +156,13 @@ func (bc *BlockChain) AddBlock(txs []*Transaction, miner string) {
 func (bc *BlockChain) FindSpendableOutputs(address string, amount int) (int, map[string][]int) {
 	unspentOutputs := make(map[string][]int)
 	accumulated := 0
+	pubKeyHash := wallet.Base58ToPubKeyHash(address)
+
 Work:
 	for _, tx := range bc.FindUnspentTransactions(address) {
 		txID := hex.EncodeToString(tx.ID)
 		for outIdx, out := range tx.Outs {
-			if string(out.PubKey) == address && accumulated < amount {
+			if bytes.Equal(out.PubKeyHash, pubKeyHash) && accumulated < amount {
 				accumulated += out.Value
 				unspentOutputs[txID] = append(unspentOutputs[txID], outIdx)
 				if accumulated >= amount {
@@ -176,9 +188,15 @@ func (bc *BlockChain) NewTransaction(w *wallet.Wallet, to string, amount int) *T
 		}
 	}
 
-	outputs := []TxOutput{{amount, []byte(to)}}
+	// ⭐️ 수정: 아웃풋 생성 시 PubKeyHash로 잠금
+	outputs := []TxOutput{
+		{Value: amount, PubKeyHash: wallet.Base58ToPubKeyHash(to)},
+	}
 	if acc > amount {
-		outputs = append(outputs, TxOutput{acc - amount, []byte(w.GetAddress())})
+		outputs = append(outputs, TxOutput{
+			Value:      acc - amount,
+			PubKeyHash: wallet.Base58ToPubKeyHash(w.GetAddress()),
+		})
 	}
 
 	tx := Transaction{nil, inputs, outputs}
@@ -193,27 +211,23 @@ func (bc *BlockChain) NewTransaction(w *wallet.Wallet, to string, amount int) *T
 	return &tx
 }
 
-// NewAttackTransaction: 해커의 지갑을 쓰지만, 인풋은 피해자의 UTXO를 강제로 가리킴
+// 💀 공격용 트랜잭션 함수
 func (bc *BlockChain) NewAttackTransaction(hackerWallet *wallet.Wallet, to string, amount int, victimTxIDStr string, victimIdx int) *Transaction {
 	var inputs []TxInput
 	var outputs []TxOutput
 
-	// 1. 피해자의 TxID를 해킹 타겟으로 설정
 	victimTxID, _ := hex.DecodeString(victimTxIDStr)
 
-	// 2. [핵심 조작]
-	// 인풋은 피해자의 것(victimTxID, victimIdx)을 가리키지만,
-	// 공개키(PubKey)는 해커의 것을 넣습니다. (나중에 해커 비밀키로 서명하기 위해)
+	// [공격] 피해자의 TxID를 쓰지만, PubKey는 해커의 것을 제출함
 	input := TxInput{victimTxID, victimIdx, nil, hackerWallet.PublicKey}
 	inputs = append(inputs, input)
 
-	// 3. 아웃풋 설정 (보통 해커 본인 주소로 보냄)
-	outputs = append(outputs, TxOutput{amount, []byte(to)})
+	// 아웃풋은 해커 주소로 설정
+	outputs = append(outputs, TxOutput{amount, wallet.Base58ToPubKeyHash(to)})
 
-	tx := &Transaction{nil, inputs, outputs}
+	tx := Transaction{nil, inputs, outputs}
 	tx.SetID()
 
-	// 4. 서명에 필요한 이전 트랜잭션 정보(피해자의 것)를 찾아옴
 	prevTXs := make(map[string]Transaction)
 	prevTX, err := bc.FindTransaction(victimTxID)
 	if err != nil {
@@ -221,10 +235,10 @@ func (bc *BlockChain) NewAttackTransaction(hackerWallet *wallet.Wallet, to strin
 	}
 	prevTXs[hex.EncodeToString(prevTX.ID)] = prevTX
 
-	// 5. 해커의 비밀키로 서명!
+	// 해커의 비밀키로 서명
 	tx.Sign(hackerWallet.GetPrivateKey(), prevTXs)
 
-	return tx
+	return &tx
 }
 
 func (bc *BlockChain) FindTransaction(ID []byte) (Transaction, error) {

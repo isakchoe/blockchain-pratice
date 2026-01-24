@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"log"
 
+	"github.com/btcsuite/btcutil/base58"
 	"golang.org/x/crypto/ripemd160"
 )
 
@@ -27,4 +28,16 @@ func Checksum(payload []byte) []byte {
 	secondSHA := sha256.Sum256(firstSHA[:])
 
 	return secondSHA[:4]
+}
+
+// Base58ToPubKeyHash: 주소(string)를 넣으면 내부의 PubKeyHash([]byte)를 추출하는 함수
+func Base58ToPubKeyHash(address string) []byte {
+	// 1. Base58로 인코딩된 주소를 디코딩합니다.
+	pubKeyHash := base58.Decode(address)
+
+	// 2. 비트코인 주소 형식상 앞의 1바이트(버전)와 뒤의 4바이트(체크섬)를 떼어냅니다.
+	// 보통 [Version(1) + PubKeyHash(20) + Checksum(4)] 구조입니다.
+	pubKeyHash = pubKeyHash[1 : len(pubKeyHash)-4]
+
+	return pubKeyHash
 }
